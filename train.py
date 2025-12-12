@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
-    LlamaForCausalLM,
+    AutoModelForCausalLM,
     GenerationConfig,
 )
 from loss import approx_kl_divergence, GRPOLoss
@@ -25,10 +25,11 @@ def load_model(
     trust_remote_code: bool = False,
     bf16: bool = True,
     device_map=None,
-) -> tuple[LlamaForCausalLM, PreTrainedTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = LlamaForCausalLM.from_pretrained(
+) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         attn_implementation="flash_attention_2",
@@ -38,16 +39,11 @@ def load_model(
     return model, tokenizer
 
 
-# DeepSeek Zero system prompt
-system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
-The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
-<answer> answer here </answer>
-"""
 
 
 @torch.no_grad()
 def rollout(
-    model: LlamaForCausalLM,
+    model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
     task: str,
     oracle_answer: str,
@@ -60,19 +56,10 @@ def rollout(
     model.eval()
 
     # 1. format prompt
-    chat_messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": task,
-        },
-    ]
-    chat_prompt = tokenizer.apply_chat_template(
-        chat_messages, tokenize=False, add_generation_prompt=True
-    )
+    
+    prompt_template = "Task: {}\nAnswer:"
+    chat_prompt = prompt_template.format(task)
+
     model_inputs = tokenizer(
         [chat_prompt],
         return_tensors="pt",
@@ -111,14 +98,8 @@ def rollout(
     # 3. determine rewards
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
     for i, completion in enumerate(completions):
-        # search answer tag
-        answer_match = re.search(
-            r"<answer>(.*?)</answer>",
-            completion,
-            flags=re.DOTALL,
-        )
-
-        answer = answer_match.group(1) if answer_match else None
+        
+        answer = completion.strip()
         reward = 0
         if answer is not None:
             if answer == oracle_answer:
@@ -150,7 +131,7 @@ def sequence_log_probs_from_logits(
 
 
 def sequences_log_probs(
-    model: LlamaForCausalLM,
+    model: AutoModelForCausalLM,
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -195,7 +176,7 @@ def main():
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name = "Qwen/Qwen3-1.7B"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
     train_batch_size = 16
